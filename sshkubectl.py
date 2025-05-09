@@ -1,15 +1,21 @@
 # Copyright (c) 2015-2025, Austin Hyde (@austinhyde)
 from __future__ import (absolute_import, division, print_function)
 
+import json
 import os
+import os.path
 import shlex
+import shutil
+import subprocess
 from packaging import version
 
 from ansible import __version__ as ansible_version
-from ansible.errors import AnsibleError
-from ansible.plugins.connection.ssh import Connection as SSHConnection
-from ansible.module_utils._text import to_text
+from ansible.plugins.connection.ssh import BUFSIZE, Connection as SSHConnection
+from ansible.errors import AnsibleError, AnsibleFileNotFound
+from ansible.module_utils._text import to_text, to_bytes
+from ansible.module_utils.six.moves import shlex_quote
 from ansible.plugins.loader import get_shell_plugin
+from ansible.parsing.yaml.loader import AnsibleLoader
 from contextlib import contextmanager
 
 __metaclass__ = type
@@ -17,13 +23,155 @@ __metaclass__ = type
 MIN_ANSIBLE_VERSION = '2.11.3'
 
 DOCUMENTATION = '''
-    connection: sshjail
-    short_description: connect via ssh client binary to jail
+    connection: sshkubectl
+    short_description: connect via ssh client binary to kubectll
     description:
         - This connection plugin allows ansible to communicate to the target machines via normal ssh command line.
     author: Austin Hyde (@austinhyde)
     version_added: historical
     options:
+      kubectl_pod:
+        description:
+          - Pod name.
+          - Required when the host name does not match pod name.
+        default: ''
+        vars:
+          - name: ansible_kubectl_pod
+        env:
+          - name: K8S_AUTH_POD
+      kubectl_container:
+        description:
+          - Container name.
+          - Required when a pod contains more than one container.
+        default: ''
+        vars:
+          - name: ansible_kubectl_container
+        env:
+          - name: K8S_AUTH_CONTAINER
+      kubectl_namespace:
+        description:
+          - The namespace of the pod
+        default: ''
+        vars:
+          - name: ansible_kubectl_namespace
+        env:
+          - name: K8S_AUTH_NAMESPACE
+      kubectl_extra_args:
+        description:
+          - Extra arguments to pass to the kubectl command line.
+          - Please be aware that this passes information directly on the command line and it could expose sensitive data.
+        default: ''
+        vars:
+          - name: ansible_kubectl_extra_args
+        env:
+          - name: K8S_AUTH_EXTRA_ARGS
+      kubectl_local_env_vars:
+        description:
+          - Local enviromantal variable to be passed locally to the kubectl command line.
+          - Please be aware that this passes information directly on the command line and it could expose sensitive data.
+        default: {}
+        type: dict
+        version_added: 3.1.0
+        vars:
+          - name: ansible_kubectl_local_env_vars
+      kubectl_kubeconfig:
+        description:
+          - Path to a kubectl config file. Defaults to I(~/.kube/config)
+          - The configuration can be provided as dictionary. Added in version 2.4.0.
+        default: ''
+        vars:
+          - name: ansible_kubectl_kubeconfig
+          - name: ansible_kubectl_config
+        env:
+          - name: K8S_AUTH_KUBECONFIG
+      kubectl_context:
+        description:
+          - The name of a context found in the K8s config file.
+        default: ''
+        vars:
+          - name: ansible_kubectl_context
+        env:
+          - name: K8S_AUTH_CONTEXT
+      kubectl_host:
+        description:
+          - URL for accessing the API.
+        default: ''
+        vars:
+          - name: ansible_kubectl_host
+          - name: ansible_kubectl_server
+        env:
+          - name: K8S_AUTH_HOST
+          - name: K8S_AUTH_SERVER
+      kubectl_username:
+        description:
+          - Provide a username for authenticating with the API.
+        default: ''
+        vars:
+          - name: ansible_kubectl_username
+          - name: ansible_kubectl_user
+        env:
+          - name: K8S_AUTH_USERNAME
+      kubectl_password:
+        description:
+          - Provide a password for authenticating with the API.
+          - Please be aware that this passes information directly on the command line and it could expose sensitive data.
+            We recommend using the file based authentication options instead.
+        default: ''
+        vars:
+          - name: ansible_kubectl_password
+        env:
+          - name: K8S_AUTH_PASSWORD
+      kubectl_token:
+        description:
+          - API authentication bearer token.
+          - Please be aware that this passes information directly on the command line and it could expose sensitive data.
+            We recommend using the file based authentication options instead.
+        vars:
+          - name: ansible_kubectl_token
+          - name: ansible_kubectl_api_key
+        env:
+          - name: K8S_AUTH_TOKEN
+          - name: K8S_AUTH_API_KEY
+      client_cert:
+        description:
+          - Path to a certificate used to authenticate with the API.
+        default: ''
+        vars:
+          - name: ansible_kubectl_cert_file
+          - name: ansible_kubectl_client_cert
+        env:
+          - name: K8S_AUTH_CERT_FILE
+        aliases: [ kubectl_cert_file ]
+      client_key:
+        description:
+          - Path to a key file used to authenticate with the API.
+        default: ''
+        vars:
+          - name: ansible_kubectl_key_file
+          - name: ansible_kubectl_client_key
+        env:
+          - name: K8S_AUTH_KEY_FILE
+        aliases: [ kubectl_key_file ]
+      ca_cert:
+        description:
+          - Path to a CA certificate used to authenticate with the API.
+        default: ''
+        vars:
+          - name: ansible_kubectl_ssl_ca_cert
+          - name: ansible_kubectl_ca_cert
+        env:
+          - name: K8S_AUTH_SSL_CA_CERT
+        aliases: [ kubectl_ssl_ca_cert ]
+      validate_certs:
+        description:
+          - Whether or not to verify the API server's SSL certificate. Defaults to I(true).
+        default: ''
+        vars:
+          - name: ansible_kubectl_verify_ssl
+          - name: ansible_kubectl_validate_certs
+        env:
+          - name: K8S_AUTH_VERIFY_SSL
+        aliases: [ kubectl_verify_ssl ]
       host:
           description: Hostname/ip to connect to.
           default: inventory_hostname
@@ -338,6 +486,23 @@ except ImportError:
     display = Display()
 
 
+CONNECTION_TRANSPORT = "sshkubectl"
+
+CONNECTION_OPTIONS = {
+    "kubectl_container": "-c",
+    "kubectl_namespace": "-n",
+    "kubectl_kubeconfig": "--kubeconfig",
+    "kubectl_context": "--context",
+    "kubectl_host": "--server",
+    "kubectl_username": "--username",
+    "kubectl_password": "--password",
+    "client_cert": "--client-certificate",
+    "client_key": "--client-key",
+    "ca_cert": "--certificate-authority",
+    "validate_certs": "--insecure-skip-tls-verify",
+    "kubectl_token": "--token",
+}
+
 # HACK: Ansible core does classname-based validation checks, to ensure connection plugins inherit directly from a class
 # named "ConnectionBase". This intermediate class works around this limitation.
 class ConnectionBase(SSHConnection):
@@ -347,12 +512,19 @@ class ConnectionBase(SSHConnection):
 class Connection(ConnectionBase):
     ''' ssh based connections '''
 
-    transport = 'sshjail'
+    transport = CONNECTION_TRANSPORT
+    connection_options = CONNECTION_OPTIONS
+    documentation = DOCUMENTATION
+    has_pipelining = True
+    #transport_cmd = None
+    # we probably should look that up on the remote host
+    transport_cmd = "kubectl"
 
     def __init__(self, *args, **kwargs):
         super(Connection, self).__init__(*args, **kwargs)
         # self.host == jailname@jailhost
         self.inventory_hostname = self.host
+        # TODO: we should support both kubectl_pod and the @ notation
         self.jailspec, self.host = self.host.split('@', 1)
         # self.jailspec == jailname
         # self.host == jailhost
@@ -363,14 +535,16 @@ class Connection(ConnectionBase):
         self.jname = None
         self.jpath = None
         self.connector = None
+        self._file_to_delete = None
 
         if version.parse(ansible_version) < version.parse(MIN_ANSIBLE_VERSION):
-            raise AnsibleError("sshjail needs at least ansible version " + MIN_ANSIBLE_VERSION)
+            raise AnsibleError("sshkubectl needs at least ansible version " + MIN_ANSIBLE_VERSION)
         # logging.warning(self._play_context.connection)
 
+    # we probably want to adapt this to discover/verify containers and pods
     def match_jail(self):
         if self.jid is None:
-            code, stdout, stderr = self._jailhost_command("jls -q jid name host.hostname path")
+            code, stdout, stderr = self._kubectlhost_command("jls -q jid name host.hostname path")
             if code != 0:
                 display.vvv("JLS stdout: %s" % stdout)
                 raise AnsibleError("jls returned non-zero!")
@@ -392,17 +566,9 @@ class Connection(ConnectionBase):
             if not found:
                 raise AnsibleError("failed to find a jail with name or hostname of '%s'" % self.jailspec)
 
-    def get_jail_path(self):
-        self.match_jail()
-        return self.jpath
-
-    def get_jail_id(self):
-        self.match_jail()
-        return self.jid
-
     def get_jail_connector(self):
         if self.connector is None:
-            code, _, _ = self._jailhost_command("which -s jailme")
+            code, _, _ = self._kubectlhost_command("which -s kubectl")
             if code != 0:
                 self.connector = 'jexec'
             else:
@@ -443,83 +609,286 @@ class Connection(ConnectionBase):
         cmd = '%s%s' % (cmd, "'")
         return cmd
 
-    def _jailhost_command(self, cmd):
+    def _kubectlhost_command(self, cmd):
         return super(Connection, self).exec_command(cmd, in_data=None, sudoable=True)
 
-    def exec_command(self, cmd, in_data=None, executable='/bin/sh', sudoable=True):
+    ### adapted/copied from kubectl.py
+    def _build_exec_cmd(self, cmd):
+        """Build the local kubectl exec command to run cmd on remote_host"""
+        local_cmd = [self.transport_cmd]
+        censored_local_cmd = [self.transport_cmd]
+
+        # Build command options based on doc string
+        doc_yaml = AnsibleLoader(self.documentation).get_single_data()
+        for key in doc_yaml.get("options"):
+            if key.endswith("verify_ssl") and self.get_option(key) != "":
+                # Translate verify_ssl to skip_verify_ssl, and output as string
+                skip_verify_ssl = not self.get_option(key)
+                local_cmd.append(
+                    "{0}={1}".format(
+                        self.connection_options[key], str(skip_verify_ssl).lower()
+                    )
+                )
+                censored_local_cmd.append(
+                    "{0}={1}".format(
+                        self.connection_options[key], str(skip_verify_ssl).lower()
+                    )
+                )
+            elif key.endswith("kubeconfig") and self.get_option(key) != "":
+                kubeconfig_path = self.get_option(key)
+                if isinstance(kubeconfig_path, dict):
+                    fd, tmpfile = tempfile.mkstemp()
+                    with os.fdopen(fd, "w") as fp:
+                        json.dump(kubeconfig_path, fp)
+                    kubeconfig_path = tmpfile
+                    self._file_to_delete = tmpfile
+
+                cmd_arg = self.connection_options[key]
+                local_cmd += [cmd_arg, kubeconfig_path]
+                censored_local_cmd += [cmd_arg, kubeconfig_path]
+            elif (
+                not key.endswith("container")
+                and self.get_option(key)
+                and self.connection_options.get(key)
+            ):
+                cmd_arg = self.connection_options[key]
+                local_cmd += [cmd_arg, self.get_option(key)]
+                # Redact password and token from console log
+                if key.endswith(("_token", "_password")):
+                    censored_local_cmd += [cmd_arg, "********"]
+                else:
+                    censored_local_cmd += [cmd_arg, self.get_option(key)]
+
+        extra_args_name = "kubectl_extra_args".format(self.transport)
+        if self.get_option(extra_args_name):
+            local_cmd += self.get_option(extra_args_name).split(" ")
+            censored_local_cmd += self.get_option(extra_args_name).split(" ")
+
+        pod = self.get_option("kubectl_pod".format(self.transport))
+        if not pod:
+            pod = self._play_context.remote_addr
+        # -i is needed to keep stdin open which allows pipelining to work
+        local_cmd += ["exec", "-i", pod]
+        censored_local_cmd += ["exec", "-i", pod]
+
+        # if the pod has more than one container, then container is required
+        container_arg_name = "kubectl_container".format(self.transport)
+        if self.get_option(container_arg_name):
+            local_cmd += ["-c", self.get_option(container_arg_name)]
+            censored_local_cmd += ["-c", self.get_option(container_arg_name)]
+
+        local_cmd += ["--"] + cmd
+        censored_local_cmd += ["--"] + cmd
+
+        return local_cmd, censored_local_cmd
+
+    ### adapted/copied from kubectl.py
+    def delete_temporary_file(self):
+        if self._file_to_delete is not None:
+            os.remove(self._file_to_delete)
+            self._file_to_delete = None
+
+    ### adapted/copied from kubectl.py
+    def _local_env(self):
+        """Return a dict of local environment variables to pass to the kubectl command"""
+        local_env = {}
+        local_local_env_vars_name = "kubectl_local_env_vars".format(self.transport)
+        local_env_vars = self.get_option(local_local_env_vars_name)
+        if local_env_vars:
+            if isinstance(local_env_vars, dict):
+                local_env_vars = json.dumps(local_env_vars)
+            local_env = os.environ.copy()
+            local_env.update(json.loads(local_env_vars))
+            return local_env
+        return None
+
+    ### adapted/copied from kubectl.py
+    def _connect(self, port=None):
+        """Connect to the container. Nothing to do"""
+        super(Connection, self)._connect()
+        if not self._connected:
+            display.vvv(
+                "ESTABLISH {0} CONNECTION".format(self.transport),
+                host=self._play_context.remote_addr,
+            )
+            self._connected = True
+
+    ### adapted/copied from kubectl.py
+    def _prefix_login_path(self, remote_path):
+        """Make sure that we put files into a standard path
+
+        If a path is relative, then we need to choose where to put it.
+        ssh chooses $HOME but we aren't guaranteed that a home dir will
+        exist in any given chroot.  So for now we're choosing "/" instead.
+        This also happens to be the former default.
+
+        Can revisit using $HOME instead if it's a problem
+        """
+        if not remote_path.startswith(os.path.sep):
+            remote_path = os.path.join(os.path.sep, remote_path)
+        return os.path.normpath(remote_path)
+
+    def exec_command(self, cmd, in_data=None, sudoable=False):
         ''' run a command in the jail '''
+
         slpcmd = False
 
         if '&& sleep 0' in cmd:
             slpcmd = True
             cmd = self._strip_sleep(cmd)
 
+        # TODO, this probably was just needed for jails
         if 'sudo' in cmd:
             cmd = self._strip_sudo(executable, cmd)
 
         self.set_option('host', self.host)
-        cmd = ' '.join([executable, '-c', shlex.quote(cmd)])
+
+        cmd = shlex.quote(cmd)
+        local_cmd, censored_local_cmd = self._build_exec_cmd(
+            [self._play_context.executable, "-c", cmd]
+        )
+
+        local_cmd = ' '.join(local_cmd)
+
         if slpcmd:
-            cmd = '%s %s %s %s' % (self.get_jail_connector(), self.get_jail_id(), cmd, '&& sleep 0')
+            local_cmd = '%s %s' % (local_cmd, '&& sleep 0')
         else:
-            cmd = '%s %s %s' % (self.get_jail_connector(), self.get_jail_id(), cmd)
+            local_cmd = '%s' % (local_cmd)
 
-        if self._play_context.become:
-            # display.debug("_low_level_execute_command(): using become for this command")
-            plugin = self.become
-            shell = get_shell_plugin(executable=executable)
-            cmd = plugin.build_become_command(cmd, shell)
-
-        # display.vvv("JAIL (%s) %s" % (local_cmd), host=self.host)
-        return super(Connection, self).exec_command(cmd, in_data, True)
-
-    def _normalize_path(self, path, prefix):
-        if not path.startswith(os.path.sep):
-            path = os.path.join(os.path.sep, path)
-        normpath = os.path.normpath(path)
-        return os.path.join(prefix, normpath[1:])
-
-    def _copy_file(self, from_file, to_file, executable='/bin/sh'):
-        copycmd = ' '.join(['cp', from_file, to_file])
-        if self._play_context.become:
-            plugin = self.become
-            shell = get_shell_plugin(executable=executable)
-            copycmd = plugin.build_become_command(copycmd, shell)
-
-        display.vvv(u"REMOTE COPY {0} TO {1}".format(from_file, to_file), host=self.inventory_hostname)
-        code, stdout, stderr = self._jailhost_command(copycmd)
-        if code != 0:
-            raise AnsibleError("failed to copy file from %s to %s:\n%s\n%s" % (from_file, to_file, stdout, stderr))
+        return super(Connection, self).exec_command(local_cmd, in_data, True)
 
     @contextmanager
     def tempfile(self):
-        code, stdout, stderr = self._jailhost_command('mktemp')
+        code, stdout, stderr = self._kubectlhost_command('mktemp')
         if code != 0:
             raise AnsibleError("failed to make temp file:\n%s\n%s" % (stdout, stderr))
         tmp = to_text(stdout.strip().split(b'\n')[-1])
 
-        code, stdout, stderr = self._jailhost_command(' '.join(['chmod 0644', tmp]))
+        code, stdout, stderr = self._kubectlhost_command(' '.join(['chmod 0644', tmp]))
         if code != 0:
             raise AnsibleError("failed to make temp file %s world readable:\n%s\n%s" % (tmp, stdout, stderr))
 
         yield tmp
 
-        code, stdout, stderr = self._jailhost_command(' '.join(['rm', tmp]))
+        code, stdout, stderr = self._kubectlhost_command(' '.join(['rm', tmp]))
         if code != 0:
             raise AnsibleError("failed to remove temp file %s:\n%s\n%s" % (tmp, stdout, stderr))
 
+    ### adapted/copied from kubectl.py
+    def _put_file(self, in_path, out_path):
+        """Transfer a file from local to the container"""
+        super(Connection, self).put_file(in_path, out_path)
+        display.vvv(
+            "PUT %s TO %s" % (in_path, out_path), host=self._play_context.remote_addr
+        )
+
+        out_path = self._prefix_login_path(out_path)
+        if not os.path.exists(to_bytes(in_path, errors="surrogate_or_strict")):
+            raise AnsibleFileNotFound("file or module does not exist: %s" % in_path)
+
+        out_path = shlex_quote(out_path)
+        # kubectl doesn't have native support for copying files into
+        # running containers, so we use kubectl exec to implement this
+        with open(to_bytes(in_path, errors="surrogate_or_strict"), "rb") as in_file:
+            if not os.fstat(in_file.fileno()).st_size:
+                count = " count=0"
+            else:
+                count = ""
+            args, dummy = self._build_exec_cmd(
+                [
+                    self._play_context.executable,
+                    "-c",
+                    "dd of=%s bs=%s%s && sleep 0" % (out_path, BUFSIZE, count),
+                ]
+            )
+            args = [to_bytes(i, errors="surrogate_or_strict") for i in args]
+            try:
+                p = subprocess.Popen(
+                    args,
+                    stdin=in_file,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=self._local_env(),
+                )
+            except OSError:
+                raise AnsibleError(
+                    "kubectl connection requires dd command in the container to put files"
+                )
+            stdout, stderr = p.communicate()
+            self.delete_temporary_file()
+
+            if p.returncode != 0:
+                raise AnsibleError(
+                    "failed to transfer file %s to %s:\n%s\n%s"
+                    % (in_path, out_path, stdout, stderr)
+                )
+
+    ### adapted/copied from kubectl.py
+    def _fetch_file(self, in_path, out_path):
+        """Fetch a file from container to local."""
+        super(Connection, self).fetch_file(in_path, out_path)
+        display.vvv(
+            "FETCH %s TO %s" % (in_path, out_path), host=self._play_context.remote_addr
+        )
+
+        in_path = self._prefix_login_path(in_path)
+        out_dir = os.path.dirname(out_path)
+
+        # kubectl doesn't have native support for fetching files from
+        # running containers, so we use kubectl exec to implement this
+        args, dummy = self._build_exec_cmd(
+            [self._play_context.executable, "-c", "dd if=%s bs=%s" % (in_path, BUFSIZE)]
+        )
+        args = [to_bytes(i, errors="surrogate_or_strict") for i in args]
+        actual_out_path = os.path.join(out_dir, os.path.basename(in_path))
+        with open(
+            to_bytes(actual_out_path, errors="surrogate_or_strict"), "wb"
+        ) as out_file:
+            try:
+                p = subprocess.Popen(
+                    args,
+                    stdin=subprocess.PIPE,
+                    stdout=out_file,
+                    stderr=subprocess.PIPE,
+                    env=self._local_env(),
+                )
+            except OSError:
+                raise AnsibleError(
+                    "{0} connection requires dd command in the container to fetch files".format(
+                        self.transport
+                    )
+                )
+            stdout, stderr = p.communicate()
+            self.delete_temporary_file()
+
+            if p.returncode != 0:
+                raise AnsibleError(
+                    "failed to fetch file %s to %s:\n%s\n%s"
+                    % (in_path, out_path, stdout, stderr)
+                )
+
+        if actual_out_path != out_path:
+            os.rename(
+                to_bytes(actual_out_path, errors="strict"),
+                to_bytes(out_path, errors="strict"),
+            )
+
     def put_file(self, in_path, out_path):
         ''' transfer a file from local to remote jail '''
-        out_path = self._normalize_path(out_path, self.get_jail_path())
 
         with self.tempfile() as tmp:
             super(Connection, self).put_file(in_path, tmp)
-            self._copy_file(tmp, out_path)
+            self._put_file(tmp, out_path)
 
     def fetch_file(self, in_path, out_path):
         ''' fetch a file from remote to local '''
-        in_path = self._normalize_path(in_path, self.get_jail_path())
 
         with self.tempfile() as tmp:
-            self._copy_file(in_path, tmp)
-            super(Connection, self).fetch_file(tmp, out_path)
+            self._fetch_file(in_path, tmp)
+            super(Connection, self).copy_file(tmp, out_path)
+
+    ### adapted/copied from kubectl.py
+    def close(self):
+        """Terminate the connection. Nothing to do for kubectl"""
+        super(Connection, self).close()
+        self._connected = False
